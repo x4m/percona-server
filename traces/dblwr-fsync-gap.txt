@@ -1,0 +1,58 @@
+Failing trace for "InnoDB: fsync the doublewrite file before writing data
+pages with O_DIRECT" (x4m/percona-server PR #2).
+
+Run: harness.py --modes stale, plain 8.4 (37cc047c), default
+innodb_flush_method (O_DIRECT).  Artifact 20260919-080037-nostart-stale
+(iteration 3 of exp-stale-unpatched.log).  Whole journal: 152636 lines;
+the crash was injected right after line 152441.
+
+Journal lines 152300-152441, filtered to the doublewrite file, fsyncs, and
+page space=9 page=396.  Format (see plshim.c):
+
+  P <file> <offset> <space> <page> <FIL_PAGE_LSN>   page image in a write
+  W <file> <offset> <len> <undo_off> <undo_len> <max lsn>   write issued
+  F <file>                                          fsync/fdatasync
+
+-------------------------------------------------------------------------
+P #ib_16384_0.dblwr 3768320 3 864 111003766
+P #ib_16384_0.dblwr 3784704 3 721 129286249
+P #ib_16384_0.dblwr 3801088 3 865 111180152
+P #ib_16384_0.dblwr 3817472 9 396 119831815          <- slot 233: copy of 9:396
+P #ib_16384_0.dblwr 3833856 9 511 110035240
+P #ib_16384_0.dblwr 3850240 9 397 113553974
+  ... 116 more slots of the same batch ...
+P #ib_16384_0.dblwr 4177920 16 386 114201828
+W #ib_16384_0.dblwr 2097152 2097152 297554432 2097152 129286249   <- batch write, 128 pages
+                                                     <- no "F #ib_16384_0.dblwr" here
+P undo_001 2359296 4294967279 144 128630146
+W undo_001 2359296 16384 299651584 16384 128630146
+P test/ledger.ibd 2162688 3 132 108570296
+W test/ledger.ibd 2162688 16384 299667968 16384 108570296
+  ...
+P test/fts_0000000000000429_00000000000000a9_index_1.ibd 6488064 9 396 119831815
+W test/fts_0000000000000429_00000000000000a9_index_1.ibd 6488064 16384 299995648 16384 119831815
+                                                     <- data page 9:396 written while its
+                                                        doublewrite copy is not durable
+-------------------------------------------------------------------------
+
+grep -c '^F .*dblwr' journal.log.last     -> 0   (never fsynced in the whole run)
+
+At the simulated power loss both writes were still pending.  The "stale"
+loss model rolled back some 512-byte sectors of each to their previous
+contents; the page and its copy were both torn.  mysqld.err at restart:
+
+[Note] [MY-013086] [InnoDB] Starting to parse redo log at lsn = 94583373, whereas checkpoint_lsn = 94583581 and start_lsn = 94583296
+[Note] [MY-013557] [InnoDB] Database page corruption or a failed file read of page [page id: space=9, page number=396]. Trying to recover it from the doublewrite file.
+[ERROR] [MY-013546] [InnoDB] Dumping the data file page (page_id=[page id: space=9, page number=396]):
+  ...
+[ERROR] [MY-013540] [InnoDB] Dumping the DBLWR page (dblwr_page_no=233):
+  ...
+[ERROR] [MY-013548] [InnoDB] [FATAL]
+[ERROR] [MY-013183] [InnoDB] Assertion failure: buf0dblwr.cc:3112:ib::fatal triggered thread 138033823536832
+
+(buf0dblwr.cc:3112 is ib::fatal(ER_IB_MSG_DBLWR_1306) in dblwr_recover_page():
+the page is corrupt and the doublewrite copy is corrupt too.)
+
+With innodb_flush_method=fsync the same batch is followed by
+"F #ib_16384_0.dblwr" before the first data page write, and the same
+harness recovered 20 of 20 crashes; with the fix, O_DIRECT does the same.
